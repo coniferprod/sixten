@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::mpsc::{Sender, Receiver};
@@ -6,8 +5,17 @@ use std::thread::{self, JoinHandle};
 use std::io::{self, BufRead, BufReader, Write};
 use std::fmt;
 use std::str::FromStr;
+use std::fs;
+use std::io::Read;
 
 use hex;
+
+use syxpack::{
+    Message, 
+    Manufacturer, 
+    find_manufacturer
+};
+
 
 enum ReplCommand {
     Set(String, String),  // set named variable to value
@@ -15,6 +23,8 @@ enum ReplCommand {
     ListOutputs,
     Quit,
     Status,  // shows the environment
+    Load(String),  // load SysEx data from file at given path
+    Identify,  // identify the current data, if any
 }
 
 enum MidiEvent {
@@ -60,6 +70,15 @@ fn parse_command(line: &str) -> Option<ReplCommand> {
 
         cmd if cmd.starts_with("status") => {
             Some(ReplCommand::Status)
+        }
+
+        cmd if cmd.starts_with("load ") => {
+            let parts: Vec<&str> = cmd.split(' ').collect();
+            Some(ReplCommand::Load(parts[1].to_string()))
+        }
+
+        cmd if cmd.starts_with("identify") => {
+            Some(ReplCommand::Identify)
         }
 
         _ => {
@@ -223,6 +242,7 @@ impl FromStr for Synth {
 struct Variables {
     input: usize,
     synth: Option<Synth>,  // current synthesizer
+    data: Option<Vec<u8>>, // loaded or received SysEx data
 }
 
 struct Sixten {
@@ -247,6 +267,7 @@ impl Sixten {
         let variables = Variables { 
             input: 0,
             synth: None,
+            data: None,
         };
 
         let (tx, rx) = mpsc::channel();
@@ -300,7 +321,11 @@ impl Sixten {
                 println!("input = {}: {}", index, self.inputs[index]);
                 match &self.variables.synth {
                     Some(synth) => println!("synth = {}", synth),
-                    None => {},
+                    None => println!("no synth set"),
+                }
+                match &self.variables.data {
+                    Some(data) => println!("data length = {} bytes", data.len()),
+                    None => println!("no data"),
                 }
             }
 
@@ -348,6 +373,25 @@ impl Sixten {
                     self.outputs.push(raw_line.to_string());
                 }
             }
+
+            ReplCommand::Load(filename) => {
+                println!("Loading data from file '{}'", &filename);
+                self.variables.data = read_file(filename);
+            }
+
+            ReplCommand::Identify => {
+                match &self.variables.data {
+                    Some(data) => {
+                        println!("identifying...");
+                        let message = Message::from_bytes(data);
+                        match message {
+                            Ok(msg) => identify(&msg),
+                            Err(e) => eprintln!("{}", e),
+                        };
+                    },
+                    None => println!("no data"),
+                }
+            }
         }
     }
 
@@ -367,8 +411,37 @@ impl Sixten {
             }
         }
     }
+}
+
+fn identify(message: &Message) {
+    match message {
+        Message::ManufacturerSpecific { manufacturer, payload } => {
+            println!("Manufacturer\n  Identifier: {}\n  Name: {}\n  Group: {}\nPayload: {} bytes",
+                hex::encode(manufacturer.to_bytes()),
+                manufacturer, manufacturer.group(), payload.len());
+        },
+        Message::Universal { kind, target, sub_id1, sub_id2, payload } => {
+            println!("Universal, kind: {}, target: {}, Sub ID1: {:X} Sub ID2: {:X} Payload: {} bytes",
+                kind, target, sub_id1, sub_id2, payload.len());
+        },
+    }
+}
 
 
+pub fn read_file(name: &String) -> Option<Vec<u8>> {
+    match fs::File::open(&name) {
+        Ok(mut f) => {
+            let mut buffer = Vec::new();
+            match f.read_to_end(&mut buffer) {
+                Ok(_) => Some(buffer),
+                Err(_) => None
+            }
+        },
+        Err(_) => {
+            eprintln!("Unable to open file '{}'", &name);
+            None
+        }
+    }
 }
 
 fn main() -> Result<(), &'static str> {
