@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::mpsc::{Sender, Receiver};
 use std::thread::{self, JoinHandle};
@@ -91,26 +91,43 @@ fn spawn_repl_thread(tx: Sender<Event>) -> JoinHandle<()> {
     })
 }
 
-fn spawn_midi_receive_thread(tx: Sender<Event>) -> JoinHandle<()> {
-    // TODO: Check that the input device is set.
-    // How to get the device from the REPL struct?
+struct MidiReceiver {
+    join_handle: Option<JoinHandle<()>>,
+    child: Child,
+}
 
-    thread::spawn(move || {
-        let mut child = Command::new("receivemidi")
-            .arg("dev")
-            .arg("WM-1 Bluetooth")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+impl MidiReceiver {
+    fn stop(&mut self) {
+        self.child.kill().ok();
+        if let Some(handle) = self.join_handle.take() {
+            handle.join().ok();
+        }
+    }
+}
 
-        let stdout = child.stdout.take().unwrap();
+fn spawn_midi_receive_thread(tx: Sender<Event>, device_name: String) -> MidiReceiver {
+    let mut child = Command::new("receivemidi")
+        .arg("dev")
+        .arg(device_name)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+
+    let join_handle = thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             let line = line.unwrap();
             let event = parse_midi_line(&line);
             tx.send(Event::MidiEvent(event)).unwrap();
         }
-    })
+    });
+
+    MidiReceiver {
+        child,
+        join_handle: Some(join_handle),
+    }
 }
 
 fn parse_midi_line(line: &str) -> MidiEvent {
@@ -152,6 +169,26 @@ enum Event {
     MidiEvent(MidiEvent),
 }
 
+fn get_inputs() -> Vec<String> {
+    let mut result = Vec::new();
+
+    let child_output = Command::new(RECEIVE_MIDI)
+        .arg("list")
+        .output()
+        .expect("should have captured process output");
+    let child_output_text = String::from_utf8(child_output.stdout).unwrap();
+    for (index, raw_line) in child_output_text.lines().enumerate() {
+        println!("{}: {}", index, raw_line);
+        result.push(raw_line.to_string());
+    }
+
+    result
+}
+
+struct Variables {
+    input: usize,
+}
+
 struct Sixten {
     // List of MIDI inputs
     inputs: Vec<String>,
@@ -159,24 +196,31 @@ struct Sixten {
     // List of MIDI outputs
     outputs: Vec<String>,
 
+    event_tx: Sender<Event>,
     event_rx: Receiver<Event>,
+    midi_receiver: MidiReceiver,
 
     should_quit: bool,
 
-    variables: HashMap<String, String>,
+    variables: Variables,
 }
 
 impl Sixten {
-    fn new() -> Self {
+    fn new(inputs: &Vec<String>) -> Self {
+        // Initialize the "input" variable with the index of the first input.
+        let variables = Variables { input: 0 };
+
         let (tx, rx) = mpsc::channel();
         spawn_repl_thread(tx.clone());
-        spawn_midi_receive_thread(tx.clone());
+        let midi_receiver = spawn_midi_receive_thread(tx.clone(), inputs[0].clone());
         Self {
-            inputs: Vec::new(),
+            inputs: inputs.to_vec(),
             outputs: Vec::new(),
+            event_tx: tx,
             event_rx: rx,
+            midi_receiver,
             should_quit: false,
-            variables: HashMap::new(),
+            variables,
         }
     }
 
@@ -213,28 +257,22 @@ impl Sixten {
             }
 
             ReplCommand::Status => {
-                for (key, value) in &self.variables {
-                    if key == "input" {
-                        let index: usize = value.parse().unwrap();
-                        println!("{} = {}: {}", 
-                            key, value, self.inputs[index]);
-                    } else if key == "output" {
-                        let index: usize = value.parse().unwrap();
-                        println!("{} = {}: {}", 
-                            key, value, self.outputs[index]);                        
-                    } else {
-                        println!("{} = {}:", key, value);
-                    }
-                }
+                let index = self.variables.input;
+                println!("input = {}: {}", index, self.inputs[index]);
             }
 
             ReplCommand::Set(variable_name, new_value) => {
-                if self.variables.contains_key(variable_name) {
-                    // Update existing value
-                    self.variables.insert(variable_name.clone(), new_value.clone());
-                } else {
-                    // Insert new value
-                    self.variables.entry(variable_name.clone()).or_insert(new_value.clone());
+                match variable_name.as_str() {
+                    "input" => {
+                        let index = new_value.parse().unwrap();
+                        self.variables.input = index;
+                        let device_name = self.inputs[index].clone();
+                        println!("Input changed, now '{}'. Stopping MIDI receiver and respawning thread", device_name);
+                        self.midi_receiver.stop();
+
+                        self.midi_receiver = spawn_midi_receive_thread(self.event_tx.clone(), device_name);
+                    },
+                    _ => eprintln!("unknown variable '{}'", variable_name),
                 }
             }
 
@@ -284,8 +322,22 @@ impl Sixten {
 
 }
 
-fn main() -> Result<(), std::io::Error> {
-    let mut sixten = Sixten::new();
+fn main() -> Result<(), &'static str> {
+    // Get the list of MIDI inputs.
+    // If there are none, just say it and quit.
+    let inputs = get_inputs();
+    if inputs.is_empty() {
+        let message = "Error: no MIDI inputs";
+        eprintln!("{}", message);
+        return Err(message);
+    }
+
+    println!("MIDI inputs:");
+    for name in &inputs {
+        println!("{}", name);
+    }
+
+    let mut sixten = Sixten::new(&inputs);
     sixten.run();
 
     Ok(())
