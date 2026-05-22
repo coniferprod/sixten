@@ -18,6 +18,7 @@ use syxpack::{
 
 
 enum ReplCommand {
+    Help,
     Set(String, String),  // set named variable to value
     ListInputs,
     ListOutputs,
@@ -79,6 +80,10 @@ fn parse_command(line: &str) -> Option<ReplCommand> {
 
         cmd if cmd.starts_with("identify") => {
             Some(ReplCommand::Identify)
+        }
+
+        cmd if cmd.starts_with("help") => {
+            Some(ReplCommand::Help)
         }
 
         _ => {
@@ -311,6 +316,10 @@ impl Sixten {
 
     fn handle_command(&mut self, cmd: &ReplCommand) {
         match cmd {
+            ReplCommand::Help => {
+                println!("Help is on the way, but not yet here.");
+            }
+
             ReplCommand::Quit => {
                 self.should_quit = true;
                 return;
