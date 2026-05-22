@@ -4,6 +4,8 @@ use std::sync::mpsc;
 use std::sync::mpsc::{Sender, Receiver};
 use std::thread::{self, JoinHandle};
 use std::io::{self, BufRead, BufReader, Write};
+use std::fmt;
+use std::str::FromStr;
 
 use hex;
 
@@ -185,8 +187,42 @@ fn get_inputs() -> Vec<String> {
     result
 }
 
+/// Represents a synthesizer known by Sixten.
+struct Synth {
+    make: String,
+    model: String,
+}
+
+impl fmt::Display for Synth {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}/{}", self.make, self.model)
+    }
+}
+
+impl FromStr for Synth {
+    type Err = String;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(String::from("empty category"));
+        }
+
+        let parts: Vec<&str> = s.split("/").collect();
+        if parts.len() == 2 {
+            Ok(Synth {
+                make: parts[0].to_string(),
+                model: parts[1].to_string(),
+            })
+        } else {
+            Err(String::from("use the make/model format"))
+        }
+    }
+}
+
 struct Variables {
     input: usize,
+    synth: Option<Synth>,  // current synthesizer
 }
 
 struct Sixten {
@@ -200,15 +236,18 @@ struct Sixten {
     event_rx: Receiver<Event>,
     midi_receiver: MidiReceiver,
 
-    should_quit: bool,
+    should_quit: bool,  // will be set to true by the 'quit' command
 
-    variables: Variables,
+    variables: Variables,  // status variables
 }
 
 impl Sixten {
     fn new(inputs: &Vec<String>) -> Self {
         // Initialize the "input" variable with the index of the first input.
-        let variables = Variables { input: 0 };
+        let variables = Variables { 
+            input: 0,
+            synth: None,
+        };
 
         let (tx, rx) = mpsc::channel();
         spawn_repl_thread(tx.clone());
@@ -259,6 +298,10 @@ impl Sixten {
             ReplCommand::Status => {
                 let index = self.variables.input;
                 println!("input = {}: {}", index, self.inputs[index]);
+                match &self.variables.synth {
+                    Some(synth) => println!("synth = {}", synth),
+                    None => {},
+                }
             }
 
             ReplCommand::Set(variable_name, new_value) => {
@@ -272,6 +315,12 @@ impl Sixten {
 
                         self.midi_receiver = spawn_midi_receive_thread(self.event_tx.clone(), device_name);
                     },
+                    "synth" => {
+                        match Synth::from_str(new_value) {
+                            Ok(synth) => self.variables.synth = Some(synth),
+                            Err(e) => eprintln!("{}", e),
+                        }
+                    }
                     _ => eprintln!("unknown variable '{}'", variable_name),
                 }
             }
