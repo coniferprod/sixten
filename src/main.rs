@@ -1,13 +1,18 @@
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::mpsc::{Sender, Receiver};
 use std::thread::{self, JoinHandle};
 use std::io::{self, BufRead, BufReader, Write};
 
+use hex;
+
 enum ReplCommand {
+    Set(String, String),  // set named variable to value
     ListInputs,
     ListOutputs,
     Quit,
+    Status,  // shows the environment
 }
 
 enum MidiEvent {
@@ -26,7 +31,19 @@ fn parse_command(line: &str) -> Option<ReplCommand> {
     match line {
         "quit" => Some(ReplCommand::Quit),
 
-        cmd if cmd.starts_with("list") => {
+        cmd if cmd.starts_with("set ") => {
+            let parts: Vec<&str> = cmd.split(' ').collect();
+            if parts.len() != 3 {
+                println!("usage: set variable value");
+                None
+            } else {
+                let variable_name = parts[1];
+                let new_value = parts[2];
+                Some(ReplCommand::Set(variable_name.to_string(), new_value.to_string()))
+            }
+        }
+
+        cmd if cmd.starts_with("list ") => {
             let parts: Vec<&str> = cmd.split(' ').collect();
             let param = parts[1];
             if param == "inputs" {
@@ -37,6 +54,10 @@ fn parse_command(line: &str) -> Option<ReplCommand> {
                 println!("usage: list inputs | outputs");
                 None
             }
+        }
+
+        cmd if cmd.starts_with("status") => {
+            Some(ReplCommand::Status)
         }
 
         _ => {
@@ -71,6 +92,9 @@ fn spawn_repl_thread(tx: Sender<Event>) -> JoinHandle<()> {
 }
 
 fn spawn_midi_receive_thread(tx: Sender<Event>) -> JoinHandle<()> {
+    // TODO: Check that the input device is set.
+    // How to get the device from the REPL struct?
+
     thread::spawn(move || {
         let mut child = Command::new("receivemidi")
             .arg("dev")
@@ -90,10 +114,31 @@ fn spawn_midi_receive_thread(tx: Sender<Event>) -> JoinHandle<()> {
 }
 
 fn parse_midi_line(line: &str) -> MidiEvent {
-    if line.starts_with("syx") {
-        //let parts = line.split(' ').collect();
-        // TODO: parse SysEx message data into vector
-        MidiEvent::SysEx(Vec::new())
+    if line.starts_with("system-exclusive") {
+        //let offset = "system-exclusive hex ".len();
+        //let mut data_string = line[offset..].to_string();
+        //data_string.retain(|c| !c.is_whitespace());
+
+        // part 0 is "system-exclusive"
+        // part 1 is "hex"
+        // parts 2..len-1 are the hex string bytes
+        // last part is "dec"
+
+        let parts: Vec<&str> = line.split(' ').collect();
+        // Drop the first two parts ("system-exclusive hex") 
+        // and the last one ("dec")
+        let hex_parts = &parts[2..parts.len()-1];  
+
+        // Make one big hex string with no spaces
+        let mut hex_string = String::new();
+        for h in hex_parts {
+            hex_string.push_str(h);
+        }
+
+        // We trust the data since it comes from ReceiveMIDI
+        let data = hex::decode(hex_string).unwrap();
+
+        MidiEvent::SysEx(data)
     } else {
         MidiEvent::Raw(String::from(line))
     }
@@ -117,6 +162,8 @@ struct Sixten {
     event_rx: Receiver<Event>,
 
     should_quit: bool,
+
+    variables: HashMap<String, String>,
 }
 
 impl Sixten {
@@ -129,6 +176,7 @@ impl Sixten {
             outputs: Vec::new(),
             event_rx: rx,
             should_quit: false,
+            variables: HashMap::new(),
         }
     }
 
@@ -164,6 +212,32 @@ impl Sixten {
                 return;
             }
 
+            ReplCommand::Status => {
+                for (key, value) in &self.variables {
+                    if key == "input" {
+                        let index: usize = value.parse().unwrap();
+                        println!("{} = {}: {}", 
+                            key, value, self.inputs[index]);
+                    } else if key == "output" {
+                        let index: usize = value.parse().unwrap();
+                        println!("{} = {}: {}", 
+                            key, value, self.outputs[index]);                        
+                    } else {
+                        println!("{} = {}:", key, value);
+                    }
+                }
+            }
+
+            ReplCommand::Set(variable_name, new_value) => {
+                if self.variables.contains_key(variable_name) {
+                    // Update existing value
+                    self.variables.insert(variable_name.clone(), new_value.clone());
+                } else {
+                    // Insert new value
+                    self.variables.entry(variable_name.clone()).or_insert(new_value.clone());
+                }
+            }
+
             ReplCommand::ListInputs => {
                 let child_output = Command::new(RECEIVE_MIDI)
                     .arg("list")
@@ -188,9 +262,6 @@ impl Sixten {
                 }
             }
         }
-
-        //print!("{}", PROMPT);
-        //io::stdout().flush().unwrap();
     }
 
     fn handle_midi(&self, msg: &MidiEvent) {
@@ -209,6 +280,8 @@ impl Sixten {
             }
         }
     }
+
+
 }
 
 fn main() -> Result<(), std::io::Error> {
