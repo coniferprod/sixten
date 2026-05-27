@@ -24,7 +24,8 @@ enum ReplCommand {
     ListOutputs,
     Quit,
     Status,  // shows the environment
-    Load(String),  // load SysEx data from file at given path
+    LoadSyx(String),  // load SysEx data from file at given path
+    LoadXml(String),  // load XML data from file at given path
     Identify,  // identify the current data, if any
 }
 
@@ -73,9 +74,14 @@ fn parse_command(line: &str) -> Option<ReplCommand> {
             Some(ReplCommand::Status)
         }
 
-        cmd if cmd.starts_with("load ") => {
+        cmd if cmd.starts_with("loadsyx ") => {
             let parts: Vec<&str> = cmd.split(' ').collect();
-            Some(ReplCommand::Load(parts[1].to_string()))
+            Some(ReplCommand::LoadSyx(parts[1].to_string()))
+        }
+
+        cmd if cmd.starts_with("loadxml ") => {
+            let parts: Vec<&str> = cmd.split(' ').collect();
+            Some(ReplCommand::LoadXml(parts[1].to_string()))
         }
 
         cmd if cmd.starts_with("identify") => {
@@ -247,7 +253,8 @@ impl FromStr for Synth {
 struct Variables {
     input: usize,
     synth: Option<Synth>,  // current synthesizer
-    data: Option<Vec<u8>>, // loaded or received SysEx data
+    syx_data: Option<Vec<u8>>, // loaded or received SysEx data
+    xml_data: Option<Vec<u8>>, // loaded or received XML data
 }
 
 struct Sixten {
@@ -272,7 +279,8 @@ impl Sixten {
         let variables = Variables { 
             input: 0,
             synth: None,
-            data: None,
+            syx_data: None,
+            xml_data: None,
         };
 
         let (tx, rx) = mpsc::channel();
@@ -332,9 +340,13 @@ impl Sixten {
                     Some(synth) => println!("synth = {}", synth),
                     None => println!("no synth set"),
                 }
-                match &self.variables.data {
-                    Some(data) => println!("data length = {} bytes", data.len()),
-                    None => println!("no data"),
+                match &self.variables.syx_data {
+                    Some(data) => println!("System Exclusive data length = {} bytes", data.len()),
+                    None => println!("no System Exclusive data"),
+                }
+                match &self.variables.xml_data {
+                    Some(data) => println!("XML data length = {} bytes", data.len()),
+                    None => println!("no XML data"),
                 }
             }
 
@@ -383,13 +395,19 @@ impl Sixten {
                 }
             }
 
-            ReplCommand::Load(filename) => {
-                println!("Loading data from file '{}'", &filename);
-                self.variables.data = read_file(filename);
+            ReplCommand::LoadSyx(filename) => {
+                println!("Loading System Exclusive data from file '{}'", &filename);
+                self.variables.syx_data = read_file(filename);
+            }
+
+            ReplCommand::LoadXml(filename) => {
+                println!("Loading XML data from file '{}'", &filename);
+                self.variables.xml_data = read_file(filename);
+                // TODO: Should we parse the XML here, or later?
             }
 
             ReplCommand::Identify => {
-                match &self.variables.data {
+                match &self.variables.syx_data {
                     Some(data) => {
                         println!("identifying...");
                         let message = Message::from_bytes(data);
