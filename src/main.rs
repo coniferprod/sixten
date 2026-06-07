@@ -12,10 +12,10 @@ use hex;
 
 use syxpack::{
     Message, 
+    UniversalKind,
     Manufacturer, 
     find_manufacturer
 };
-
 
 enum ReplCommand {
     Help,
@@ -26,7 +26,7 @@ enum ReplCommand {
     Status,  // shows the environment
     LoadSyx(String),  // load SysEx data from file at given path
     LoadXml(String),  // load XML data from file at given path
-    Identify,  // identify the current data, if any
+    Identify(String),  // identify the current data, if any, or the synth
 }
 
 enum MidiEvent {
@@ -85,7 +85,8 @@ fn parse_command(line: &str) -> Option<ReplCommand> {
         }
 
         cmd if cmd.starts_with("identify") => {
-            Some(ReplCommand::Identify)
+            let parts: Vec<&str> = cmd.split(' ').collect();
+            Some(ReplCommand::Identify(parts[1].to_string()))
         }
 
         cmd if cmd.starts_with("help") => {
@@ -210,7 +211,23 @@ fn get_inputs() -> Vec<String> {
         .expect("should have captured process output");
     let child_output_text = String::from_utf8(child_output.stdout).unwrap();
     for (index, raw_line) in child_output_text.lines().enumerate() {
-        println!("{}: {}", index, raw_line);
+        //println!("{}: {}", index, raw_line);
+        result.push(raw_line.to_string());
+    }
+
+    result
+}
+
+fn get_outputs() -> Vec<String> {
+    let mut result = Vec::new();
+
+    let child_output = Command::new(SEND_MIDI)
+        .arg("list")
+        .output()
+        .expect("should have captured process output");
+    let child_output_text = String::from_utf8(child_output.stdout).unwrap();
+    for (index, raw_line) in child_output_text.lines().enumerate() {
+        //println!("{}: {}", index, raw_line);
         result.push(raw_line.to_string());
     }
 
@@ -252,6 +269,7 @@ impl FromStr for Synth {
 
 struct Variables {
     input: usize,
+    output: usize,
     synth: Option<Synth>,  // current synthesizer
     syx_data: Option<Vec<u8>>, // loaded or received SysEx data
     xml_data: Option<Vec<u8>>, // loaded or received XML data
@@ -274,10 +292,11 @@ struct Sixten {
 }
 
 impl Sixten {
-    fn new(inputs: &Vec<String>) -> Self {
+    fn new(inputs: &Vec<String>, outputs: &Vec<String>) -> Self {
         // Initialize the "input" variable with the index of the first input.
         let variables = Variables { 
             input: 0,
+            output: 0,
             synth: None,
             syx_data: None,
             xml_data: None,
@@ -288,7 +307,7 @@ impl Sixten {
         let midi_receiver = spawn_midi_receive_thread(tx.clone(), inputs[0].clone());
         Self {
             inputs: inputs.to_vec(),
-            outputs: Vec::new(),
+            outputs: outputs.to_vec(),
             event_tx: tx,
             event_rx: rx,
             midi_receiver,
@@ -361,6 +380,12 @@ impl Sixten {
 
                         self.midi_receiver = spawn_midi_receive_thread(self.event_tx.clone(), device_name);
                     },
+                    "output" => {
+                        let index = new_value.parse().unwrap();
+                        self.variables.output = index;
+                        let device_name = self.outputs[index].clone();
+                        println!("Output changed, now '{}'", device_name);
+                    }
                     "synth" => {
                         match Synth::from_str(new_value) {
                             Ok(synth) => self.variables.synth = Some(synth),
@@ -406,17 +431,64 @@ impl Sixten {
                 // TODO: Should we parse the XML here, or later?
             }
 
-            ReplCommand::Identify => {
-                match &self.variables.syx_data {
-                    Some(data) => {
-                        println!("identifying...");
-                        let message = Message::from_bytes(data);
-                        match message {
-                            Ok(msg) => identify(&msg),
-                            Err(e) => eprintln!("{}", e),
+            ReplCommand::Identify(target) => {
+                match target.as_str() {
+                    "synth" => {
+                        let index = self.variables.output;
+                        let device_name = self.outputs[index].clone();
+
+                        println!("Sending MIDI SysEx inquiry to synth");
+                        
+                        // Initial arguments; the individual bytes are added later
+                        let mut args: Vec<String> = vec![
+                            String::from("dev"), 
+                            String::from(&device_name), 
+                            String::from("syx"), 
+                            String::from("hex"),
+                        ];
+                        
+                        let message = Message::Universal { 
+                            kind: UniversalKind::NonRealTime, 
+                            target: 0x7f, // broadcast to all devices
+                            sub_id1: 0x06, // sub ID 1 (General Information)
+                            sub_id2: 0x01, // sub ID 2 (Identity Request)
+                            payload: vec![],
                         };
+                        let mut message_bytes = message.to_bytes();
+                        // SendMIDI does not want the initiator and terminator bytes,
+                        // so get rid of them:
+                        message_bytes.pop();  // remove last element
+                        message_bytes.remove(0); // remove first element
+
+                        // Add the message bytes to the argument list:
+                        for mb in message_bytes {
+                            let bs = format!("{:02X}", mb);
+                            args.push(bs);
+                        }
+
+                        let child_output = Command::new(SEND_MIDI)
+                            .args(args)
+                            .output()
+                            .expect("should have captured process output");
+                        let child_output_text = String::from_utf8(child_output.stdout).unwrap();
+                        for line in child_output_text.lines() {
+                            println!("{}", line);
+                        }
                     },
-                    None => println!("no data"),
+                    "message" => {
+                        match &self.variables.syx_data {
+                            Some(data) => {
+                                println!("identifying...");
+                                let message = Message::from_bytes(data);
+                                match message {
+                                    Ok(msg) => identify(&msg),
+                                    Err(e) => eprintln!("{}", e),
+                                };
+                            },
+                            None => println!("no System Exclusive data"),
+                        }
+                    },
+                    _ => eprintln!("unknown target '{}'", target),
                 }
             }
         }
@@ -426,6 +498,16 @@ impl Sixten {
         match msg {
             MidiEvent::SysEx(data) => {
                 println!("SysEx data length = {}", data.len());
+                let mut message_bytes: Vec<u8> = Vec::new();
+                message_bytes.push(0xf0);
+                for b in data {
+                    message_bytes.push(*b);
+                }
+                message_bytes.push(0xf7);
+                match Message::from_bytes(&message_bytes) {
+                    Ok(message) => println!("{:?}", message),
+                    Err(e) => eprintln!("Invalid SysEx message"),
+                }
             }
 
             MidiEvent::Raw(line) => {
@@ -481,12 +563,26 @@ fn main() -> Result<(), &'static str> {
         return Err(message);
     }
 
-    println!("MIDI inputs:");
-    for name in &inputs {
-        println!("{}", name);
+    println!();
+
+    let outputs = get_outputs();
+    if outputs.is_empty() {
+        let message = "Error: no MIDI outputs";
+        eprintln!("{}", message);
+        return Err(message);
     }
 
-    let mut sixten = Sixten::new(&inputs);
+    println!("MIDI inputs:");
+    for (index, name) in (&inputs).into_iter().enumerate() {
+        println!("{}: {}", index, name);
+    }
+
+    println!("MIDI outputs:");
+    for (index, name) in (&outputs).into_iter().enumerate() {
+        println!("{}: {}", index, name);
+    }
+
+    let mut sixten = Sixten::new(&inputs, &outputs);
     sixten.run();
 
     Ok(())
